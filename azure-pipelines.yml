@@ -1,0 +1,181 @@
+# Starter pipeline
+# Start with a minimal pipeline that you can customize to build and deploy your code.
+# Add steps that build, run tests, deploy, and more:
+# https://aka.ms/yaml
+
+trigger: none
+
+parameters:
+- name: DeployInfra
+  type: boolean
+  default: false
+- name: DeployApptoStage
+  type: boolean
+  default: false
+- name: DeployApptoProd
+  type: boolean
+  default: false
+
+pool:
+  vmImage: ubuntu-latest
+
+variables:
+  bkstrrg: 'rg-avd'
+  bkstrg: 'tfteststorage09032023'
+  bkcontainer: 'tfstate'
+  bkstrgkey: 'devpipeline.terraform.tfstate'
+  PSFunctionFolderName: FunctionApp
+  var_functionName: 'orbittaskfunctionapp'
+  var_rg_name: 'terraformtestrg'
+
+
+stages:
+  - stage: BuildStage
+    jobs:
+      - job: validate
+        displayName: "Validate Function and Terraform Code"
+        continueOnError: false
+        steps:
+          - powershell: ./Tests/Invoke-Pester.ps1
+            displayName: "Run Function Code Test"
+            failOnStderr: true
+            continueOnError: true
+          - task: PublishTestResults@2
+            inputs:
+              testResultsFormat: 'NUnit'
+              testResultsFiles: '**/*TestResults.xml'
+              failTaskOnFailedTests: true
+          - task: TerraformInstaller@1
+            displayName: tfinstall
+            inputs:
+              terraformVersion: 'latest'
+          - task: TerraformTaskV4@4
+            displayName: init
+            inputs:
+              provider: 'azurerm'
+              command: 'init'
+              backendServiceArm: 'Lab Subscription Connection'
+              backendAzureRmResourceGroupName: '$(bkstrrg)'
+              backendAzureRmStorageAccountName: '$(bkstrg)'
+              backendAzureRmContainerName: '$(bkcontainer)'
+              backendAzureRmKey: '$(bkstrgkey)'
+          - task: TerraformTaskV4@4
+            displayName: Validate
+            inputs:
+              provider: 'azurerm'
+              command: 'validate'
+          - task: ArchiveFiles@2
+            displayName: 'Archive files Functions'
+            inputs:
+              rootFolderOrFile: '$(System.DefaultWorkingDirectory)/$(PSFunctionFolderName)'
+              includeRootFolder: false
+              archiveType: zip
+              archiveFile: $(Build.ArtifactStagingDirectory)/$(PSFunctionFolderName)/$(Build.BuildId).zip
+              replaceExistingArchive: true
+          - task: PublishBuildArtifacts@1
+            inputs:
+              PathtoPublish: '$(Build.ArtifactStagingDirectory)'
+              ArtifactName: 'drop'
+
+  - stage: DeployStage
+    dependsOn: BuildStage
+    jobs:
+      - job: TFplan
+        displayName: "Terraform Plan"
+        condition: eq('${{parameters.DeployInfra}}', true)
+        continueOnError: false
+        steps:
+          - task: TerraformInstaller@1
+            displayName: tfinstall
+            inputs:
+              terraformVersion: 'latest'
+          - task: TerraformTaskV4@4
+            displayName: init
+            inputs:
+              provider: 'azurerm'
+              command: 'init'
+              backendServiceArm: 'Lab Subscription Connection'
+              backendAzureRmResourceGroupName: '$(bkstrrg)'
+              backendAzureRmStorageAccountName: '$(bkstrg)'
+              backendAzureRmContainerName: '$(bkcontainer)'
+              backendAzureRmKey: '$(bkstrgkey)'
+          - task: TerraformTaskV4@4
+            displayName: plan
+            inputs:
+              provider: 'azurerm'
+              command: 'plan'
+              environmentServiceNameAzureRM: 'Lab Subscription Connection'
+      - job: manual_approval
+        condition: eq('${{parameters.DeployInfra}}', true)
+        displayName: "Terraform Deployment Verification"
+        dependsOn: TFplan
+        pool: server
+        steps:
+          - task: ManualValidation@0
+            timeoutInMinutes: 1440 
+            inputs:
+              notifyUsers: 'ozgurdede006@gmail.com'
+              instructions: 'Please check the plan result before proceeding with approval'
+              onTimeout: "reject"
+      - job: TFdeploy
+        condition: eq('${{parameters.DeployInfra}}', true)
+        displayName: "Deploy Infrastracture"
+        dependsOn: manual_approval
+        steps:
+          - task: TerraformTaskV4@4
+            displayName: init
+            inputs:
+              provider: 'azurerm'
+              command: 'init'
+              backendServiceArm: 'Lab Subscription Connection'
+              backendAzureRmResourceGroupName: '$(bkstrrg)'
+              backendAzureRmStorageAccountName: '$(bkstrg)'
+              backendAzureRmContainerName: '$(bkcontainer)'
+              backendAzureRmKey: '$(bkstrgkey)'
+
+          - task: TerraformTaskV4@4
+            displayName: Apply
+            inputs:
+              provider: 'azurerm'
+              command: 'apply'
+              environmentServiceNameAzureRM: 'Lab Subscription Connection'
+      - job: deployAppStaging
+        dependsOn: TFdeploy
+        displayName: "Deploy Function Code to Staging"
+        condition: eq('${{parameters.DeployApptoStage}}', true)
+        steps:
+          - task: DownloadBuildArtifacts@1
+            inputs:
+              buildType: 'current'
+              downloadType: 'single'
+              artifactName: 'drop'
+              downloadPath: '$(Build.ArtifactStagingDirectory)'
+          - task: AzureFunctionApp@1
+            displayName: 'Azure functions app deploy $(PSFunctionFolderName) to production slot'
+            inputs:
+              azureSubscription: 'Lab Subscription Connection'
+              appType: functionApp
+              slotName: 'staging'
+              appName: $(var_functionName)
+              package: '$(Build.ArtifactStagingDirectory)/drop/$(PSFunctionFolderName)/$(Build.BuildId).zip'
+              deploymentMethod: zipDeploy   
+      - job: deployAppProd
+        dependsOn: TFdeploy
+        displayName: "Deploy Function Code to Prod"
+        condition: eq('${{parameters.DeployApptoProd}}', true)
+        steps:
+          - task: DownloadBuildArtifacts@1
+            inputs:
+              buildType: 'current'
+              downloadType: 'single'
+              artifactName: 'drop'
+              downloadPath: '$(Build.ArtifactStagingDirectory)'
+          - task: AzureFunctionApp@1
+            displayName: 'Azure functions app deploy $(PSFunctionFolderName) to production slot'
+            inputs:
+              azureSubscription: 'Lab Subscription Connection'
+              appType: functionApp
+              appName: $(var_functionName)
+              package: '$(Build.ArtifactStagingDirectory)/drop/$(PSFunctionFolderName)/$(Build.BuildId).zip'
+              deploymentMethod: zipDeploy
+

@@ -1,0 +1,5 @@
+resourcegroup_name = "terraformtestrg"
+location = "West US"
+str_account_name = "orbittask11032023"
+app_service_plan = "orbittaskappserviceplan"
+function_app = "orbittaskfunctionapp"
